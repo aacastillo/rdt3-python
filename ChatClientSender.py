@@ -1,17 +1,19 @@
-import argparse
-import time
+import argparse, time, pickle, _thread, traceback
 from socket import *
+from server_commands import *
+from packets import *
 
 # CONSTANTS
-PAYLOAD = 1500                      # size of UDP payload, without headers
-TIMEOUT = 1                         # retransmission time in seconds
-TYPE_DATA = 2                       # This will be a header in the message packet
-TYPE_ACK = 3                        # This will be a header in the message packet
+PAYLOAD = 1900
+TIMEOUT = 1
+STOPPED_TIME = -1
+SLEEP = 0.1
 
 # Handle command line arguments
-# python3 ChatClientSender.py -s server_name -p port_number -t filename1 filename2
+# python ChatClientSender.py -t redsox.jpg redsox2.jpg
+# python ChatClientSender.py -s server_name -p port_number -t filename1 filename2
 def set_command_line_args():
-    global __server_addr, __local_file, __transfer_loc
+    global server_addr, local_file, transfer_loc
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-s", "--Server", help = "Server Name")
@@ -21,125 +23,127 @@ def set_command_line_args():
     args = parser.parse_args()
 
     server_name = args.Server if args.Server else 'date.cs.umass.edu'
-    server_port = args.Port if args.Port else 8888
-    __server_addr = (server_name, server_port)
-    __local_file = args.Tag[0] if args.Tag else 'stdin'
-    __transfer_loc = args.Tag[1] if args.tag else 'stdout'
+    server_port = int(args.Port) if args.Port else 8888
+    server_addr = (server_name, server_port)
+    local_file = args.Tag[0] if args.Tag else 'stdin'
+    transfer_loc = args.Tag[1] if args.Tag else 'stdout'
 
-
-# Setting up UDP
-def create_udp_socket():
-    # NOTE: Max size 2048 bytes can send
-    return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-#Setting up connection with Message Server
-def connect_to_relay_server(socket):
-    name_command = "NAME aacastilloSender"
-    relay_command = "CONN aacastilloReciever"
-
-    send_name_command(name_command, socket)
-    send_relay_command(relay_command, socket)
-
-# NOTE: have to use the ". " command to exit relay mode, Use Quit command to clear control commands, and exit gracefully
-def send_name_command(command, socket):
-    global TIMEOUT, __server_addr
-    socket.settimeout(TIMEOUT)
-    socket.sendto(command.encode(), __server_addr)
-
-    try:
-        response, server = socket.recvfrom(2048)
-        print("[INFO] relay server response to command is: %s", response.decode())
-        if (response.decode() != "OK Hello aacastilloSender"):
-            print("[ERROR] Incorrect response from server, retrying NAME_command")
-            send_name_command(command, socket)
-    except socket.timeout:
-        print("[INFO] Retrying sending NAME_command to relay server")
-        send_name_command(command, socket)
-
-    socket.settimeout(None)
-    print("[INFO] Successful name command sent and correct response recieved")
-
-
-def send_relay_command(command, socket):
-    global TIMEOUT, __server_addr
-    socket.settimeout(TIMEOUT)
-    socket.sendto(command.encode(), __server_addr)
-
-    try:
-        response, server = socket.recvfrom(2048)
-        print("[INFO] relay server response to command is: %s", response.decode())
-        if ("OK Relaying to aacastilloReciever" not in response.decode()):
-            print("[ERROR] Incorrect response from server, retrying RELAY_command")
-            send_name_command(command, socket)
-    except socket.timeout:
-        print("[INFO] Retrying sending RELAY_command to relay server")
-        send_name_command(command, socket)
-
-    socket.settimeout(None)
-    print("[INFO] Successful name command sent and correct response recieved")
-
-# get_data() => data[] of size 1500
-def get_data():
-    global __local_file, PAYLOAD
-    if __local_file == "stdin":
-        data = input('Input message:')
-    else:
-        data = open(__local_file)
-    data_arr = [data[i:i+PAYLOAD] for i in range(0,len(data), PAYLOAD)]
-    print("[INFO] Data array: ", data_arr)
-    return data_arr
-
-def rdt_send_all(data_arr):
-    while data_arr:
-        data = data_arr.pop(0)
-        #CAUTION: encode() is for strings, do you need this for fiel data?
-        rdt_send(data.encode())
-
-def rdt_send(data):
+# get_packets() => packets[]
+# NOTE: Packet: [checksum, seq_num, final_flag, file_location, data]
+def get_packets():
+    global local_file, PAYLOAD, transfer_loc
     
-    #If file is default StdIn
-        #Take input message from standard input
-        #Break down string into an array of messages with chunk length 1500
-        #let seq = 0
-        #while len(array) != 0:
-            # if seq==0
-                # rdt_send(data)
-                    # if len(array) = 1, set finalflag = 1
-                    # pkt = make_pkt(checksum, sequence, finalflag, data)
-                    # udt_send(pkt)
-                    # start_timer
-                    # wait for Ack0
-                        # rcv_pkt, if corrupt(rcv_pkt) || isAck(rcv_pkt, (seq+1)%2)
-                        # if notcorrupt(rcv_pkt) && isAck(rcvPkt)
-                            # stop timeout
-                            # Set seq = 1
-                        # if timeout, udt_send(pkt) again, restart timeout again
-            # if seq==1
-                # rdt_send(data)
-                    # pkt = make_pkt(checksum, sequence, finalflag, data)
-                    # udt_send(pkt)
-                    # start_timer
-                    # wait for Ack0
-                        # rcv_pkt, if corrupt(rcv_pkt) || isAck(rcv_pkt, (seq+1)%2)
-                        # if notcorrupt(rcv_pkt) && isAck(rcvPkt)
-                            # stop timeout
-                            # Set seq = 1
-                        # if timeout, udt_send(pkt) again, restart timeout again
+    packets = []
+    seq_num = 0
 
-    # If file is local filename
-        #Get local file from directory
-        #break down file into array of bytes with chunk length 1500
-        #repeat
-    # Note: How to make checksum
+    if local_file == "stdin":
+        file = open("__stdin__", w)
+        data = input('Input message:')
+        file.write(data)
+        file.close()
+        file = open("__stdin__", "rb")
+    else:
+        file = open(local_file, "rb")
+    
+    while True:
+        data = file.read(PAYLOAD)
+        if not data:
+            break
+        packets.append(make_sender_packet(seq_num, 0, transfer_loc, data)) 
+        seq_num += 1
+    
+    file.close()
 
+    #NOTE: Empty packet with final flag, so receiver knows its the last packet
+    packets.append(make_sender_packet(seq_num, 1, transfer_loc, b'')) 
 
+    # print("[SERIAL_PKT] Serialized packets list")
+    return packets
 
-# from socket import *
-# serverName = 'localhost'
-# serverPort = 12000
-# clientSocket = socket(AF_INET, SOCK_DGRAM)
-# message = input('Input lowercase sentence:')
-# clientSocket.sendto(message.encode(),(serverName, serverPort))
-# modifiedMessage, serverAddress = clientSocket.recvfrom(2048)
-# print (modifiedMessage.decode())
-# clientSocket.close()
+def rdt_gbn_send(packets, socket):
+    global mutex, send_base, server_addr, send_base_timer, TIMEOUT, STOPPED_TIME, SLEEP
+
+    mutex = _thread.allocate_lock()
+    send_base = 0
+    next_seq_num = 0
+    send_base_timer = STOPPED_TIME
+    window_size = set_window_size(len(packets), send_base)
+    
+    _thread.start_new_thread(rdt_gbn_receive, (socket,))
+    
+    while send_base < len(packets):
+        mutex.acquire()
+
+        window_size = set_window_size(len(packets), send_base)
+
+        # Send all the packets in the window
+        # print("[PACKETS] sending all packets with next_seq: %d, base: %d and window: %d and num_packets: %d" % (next_seq_num, send_base, window_size, len(packets)))
+        while next_seq_num < send_base + window_size:
+            socket.sendto(packets[next_seq_num], server_addr)
+            next_seq_num += 1
+
+        # Start timer for send_base
+        if send_base_timer == STOPPED_TIME:
+            # print("[TIMER] Starting send base timer")
+            send_base_timer = time.time()
+
+        while send_base_timer != STOPPED_TIME and time.time() - send_base_timer < TIMEOUT:
+            mutex.release()
+            # # print("[SLEEP]")
+            time.sleep(SLEEP)
+            mutex.acquire()
+
+        if send_base_timer == STOPPED_TIME:
+            window_size = set_window_size(len(packets), send_base)
+            # print("[ACK/WINDOW] received ACK(s), shifting window: %d" %(window_size,))
+        if time.time()-send_base_timer >= TIMEOUT: # Timeout occured
+            send_base_timer = STOPPED_TIME
+            next_seq_num = send_base # restart send of entire window
+            # print("[TIMEOUT] Send base packet timeout occured, next_seq: %d" %(next_seq_num,))        
+        
+        mutex.release()
+
+def rdt_gbn_receive(socket):
+    global mutex, send_base, send_base_timer, STOPPED_TIME
+
+    while True:
+        serial_pkt, server = socket.recvfrom(2048)
+        pkt = []
+        try:
+            pkt = pickle.loads(serial_pkt)
+            # NOTE: Packet: [checksum, seq_num, final_flag, data]
+            if is_correct_checksum(pkt):
+                ack_seq_num = pkt[0]
+                final_flag = pkt[1]
+
+                mutex.acquire()
+                send_base = ack_seq_num + 1
+                send_base_timer = STOPPED_TIME
+                # print("[ACK] receiver has ACK: %d, final flag: %d, time: %f, and updated base: %d" % (ack_seq_num, final_flag, time.time(), send_base))
+                mutex.release()
+
+                if final_flag:
+                    # print("[END] final flag received")
+                    break
+        except pickle.UnpicklingError:
+            # print("[PICKLE] pickle corruped")
+            pass
+        except:
+            traceback.print_exc()
+    exit_server(socket)
+
+def main():
+    global server_addr
+    set_command_line_args()
+    socket = create_udp_socket()
+    try:
+        connect_to_relay_server(socket, server_addr, "Sender")
+        packets = get_packets()
+        rdt_gbn_send(packets, socket)
+    except:
+        traceback.print_exc()
+        exit_server(socket)
+    exit_server(socket)
+    
+
+main()
